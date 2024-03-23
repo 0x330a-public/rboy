@@ -456,6 +456,7 @@ fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output
 }
 
 fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver<GBEvent>) {
+    let periodic = timer_periodic(16);
     let mut limit_speed = true;
 
     let waitticks = (4194304f64 / 1000.0 * 16.0).round() as u32;
@@ -492,9 +493,9 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
             }
         }
 
+        if limit_speed { let _ = periodic.recv(); }
     }
 }
-
 fn timer_periodic(ms: u64) -> Receiver<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
