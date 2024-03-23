@@ -1,27 +1,26 @@
 #![crate_name = "rboy"]
 
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::io::{self, BufWriter, Cursor, Read};
+use std::collections::HashMap;
+use std::io::{self, Cursor, Read};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{header, Response, StatusCode};
-use axum::response::IntoResponse;
 use axum::{Json, Router};
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use cpal::{FromSample, Sample};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use glium::glutin::surface::{ResizeableSurface, SurfaceTypeTrait};
-use glium::texture::{ClientFormat, RawImage2d};
 use glium::texture::texture2d::Texture2d;
 use image::{ImageBuffer, ImageFormat, Rgb};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use winit::event::ElementState::{Pressed, Released};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 
 use rboy::{KeypadKey, SCREEN_H, SCREEN_W};
@@ -71,7 +70,7 @@ impl ArgParseError {
 
 struct AppState {
     pending_moves: Vec<KeypadKey>,
-    image_buffer: ImageBuffer::<Rgb<u8>, Vec<u8>>
+    image_buffer: ImageBuffer::<Rgb<u8>, Vec<u8>>,
 }
 
 impl std::fmt::Display for ArgParseError {
@@ -100,16 +99,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct InputRequest {
-    input: String
+    input: String,
 }
 
 async fn new_move(
     State(state): State<Arc<Mutex<AppState>>>,
-    Json(body): Json<InputRequest>
+    Json(body): Json<InputRequest>,
 ) -> impl IntoResponse {
-
     let mut app_state = state.lock().unwrap();
 
     let add_move = match body.input.as_str() {
@@ -132,7 +130,7 @@ async fn new_move(
         StatusCode::CREATED
     } else {
         StatusCode::BAD_REQUEST
-    }
+    };
 }
 
 async fn get_buffer(State(state): State<Arc<Mutex<AppState>>>) -> impl IntoResponse {
@@ -143,7 +141,8 @@ async fn get_buffer(State(state): State<Arc<Mutex<AppState>>>) -> impl IntoRespo
     buffer.write_to(&mut writer, ImageFormat::Jpeg).unwrap();
 
     let headers = [
-        (header::CONTENT_TYPE, "image/jpeg")
+        (header::CONTENT_TYPE, "image/jpeg"),
+        (header::CACHE_CONTROL, "no-cache"),
     ];
 
     return (headers, writer.into_inner()).into_response();
@@ -226,6 +225,8 @@ async fn real_main() -> i32 {
     let romname = cpu.romname();
 
     let (sender1, receiver1) = mpsc::channel();
+    let sender1 = Arc::new(Mutex::new(sender1));
+    let sender1_timer = sender1.clone();
     let (sender2, receiver2) = mpsc::sync_channel(1);
 
     let mut event_loop = winit::event_loop::EventLoop::new().unwrap();
@@ -241,14 +242,43 @@ async fn real_main() -> i32 {
         rboy::SCREEN_H as u32)
         .unwrap();
 
-    let render_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(SCREEN_W as u32, SCREEN_H as u32);
-
     let app_state = AppState {
         pending_moves: Vec::new(),
-        image_buffer: render_buffer
+        image_buffer: ImageBuffer::<Rgb<u8>, Vec<u8>>::new(SCREEN_W as u32, SCREEN_H as u32),
     };
 
     let app_state = Arc::new(Mutex::new(app_state));
+    let timer_state = Arc::clone(&app_state);
+
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+
+        loop {
+            interval.tick().await;
+            let top_key = if let Some(mut state) = timer_state.lock().ok() {
+                let mut move_map: HashMap<KeypadKey, u32> = HashMap::new();
+                for next_move in state.pending_moves.clone() {
+                    let count = move_map.entry(next_move).or_insert(0);
+                    *count += 1;
+                }
+                state.pending_moves.clear();
+                move_map.iter().max_by(|(_, i), (_, i2)| i.cmp(i2)).and_then(|(k, _)| Some(k.clone()))
+            } else {
+                None
+            };
+            if let Some(top_key) = top_key {
+                {
+                    let sender1 = sender1_timer.lock().unwrap();
+                    _ = sender1.send(GBEvent::KeyDown(top_key));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                {
+                    let sender1 = sender1_timer.lock().unwrap();
+                    _ = sender1.send(GBEvent::KeyUp(top_key));
+                }
+            }
+        }
+    });
 
     let app = Router::new()
         .route("/buffer", get(get_buffer))
@@ -279,6 +309,8 @@ async fn real_main() -> i32 {
             use winit::event::{Event, WindowEvent};
             use winit::event::ElementState::{Pressed, Released};
             use winit::keyboard::{Key, NamedKey};
+
+            let sender1 = sender1.lock().unwrap();
 
             match ev {
                 Event::WindowEvent { event, .. } => match event {
@@ -424,7 +456,6 @@ fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output
 }
 
 fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver<GBEvent>) {
-    let periodic = timer_periodic(16);
     let mut limit_speed = true;
 
     let waitticks = (4194304f64 / 1000.0 * 16.0).round() as u32;
@@ -461,7 +492,6 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
             }
         }
 
-        if limit_speed { let _ = periodic.recv(); }
     }
 }
 
