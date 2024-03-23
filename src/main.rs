@@ -1,16 +1,34 @@
 #![crate_name = "rboy"]
 
-use rboy::device::Device;
-use std::io::{self, Read};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::io::{self, BufWriter, Cursor, Read};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
-use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use cpal::{Sample, FromSample};
+
+use anyhow::{bail, Result};
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{header, Response, StatusCode};
+use axum::response::IntoResponse;
+use axum::{Json, Router};
+use axum::routing::{get, post};
+use cpal::{FromSample, Sample};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use glium::glutin::surface::{ResizeableSurface, SurfaceTypeTrait};
+use glium::texture::{ClientFormat, RawImage2d};
+use glium::texture::texture2d::Texture2d;
+use image::{ImageBuffer, ImageFormat, Rgb};
+use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 
-const EXITCODE_SUCCESS : i32 = 0;
-const EXITCODE_CPULOADFAILS : i32 = 2;
+use rboy::{KeypadKey, SCREEN_H, SCREEN_W};
+use rboy::device::Device;
+
+const EXITCODE_SUCCESS: i32 = 0;
+const EXITCODE_CPULOADFAILS: i32 = 2;
 
 #[derive(Default)]
 struct RenderOptions {
@@ -25,7 +43,7 @@ enum GBEvent {
 }
 
 #[cfg(target_os = "windows")]
-fn create_window_builder(romname: &str)-> winit::window::WindowBuilder{
+fn create_window_builder(romname: &str) -> winit::window::WindowBuilder {
     use winit::platform::windows::WindowBuilderExtWindows;
     return winit::window::WindowBuilder::new()
         .with_drag_and_drop(false)
@@ -33,7 +51,7 @@ fn create_window_builder(romname: &str)-> winit::window::WindowBuilder{
 }
 
 #[cfg(not(target_os = "windows"))]
-fn create_window_builder(romname: &str)-> winit::window::WindowBuilder {
+fn create_window_builder(romname: &str) -> winit::window::WindowBuilder {
     return winit::window::WindowBuilder::new()
         .with_title("RBoy - ".to_owned() + romname);
 }
@@ -49,6 +67,11 @@ impl ArgParseError {
             message: message.into(),
         }
     }
+}
+
+struct AppState {
+    pending_moves: Vec<KeypadKey>,
+    image_buffer: ImageBuffer::<Rgb<u8>, Vec<u8>>
 }
 
 impl std::fmt::Display for ArgParseError {
@@ -68,54 +91,105 @@ fn parse_scale_var(arg: &str) -> Result<u32, ArgParseError> {
     }
 }
 
-fn main() {
-    let exit_status = real_main();
+#[tokio::main]
+async fn main() -> Result<()> {
+    let exit_status = real_main().await;
     if exit_status != EXITCODE_SUCCESS {
-        std::process::exit(exit_status);
+        bail!(exit_status);
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct InputRequest {
+    input: String
+}
+
+async fn new_move(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Json(body): Json<InputRequest>
+) -> impl IntoResponse {
+
+    let mut app_state = state.lock().unwrap();
+
+    let add_move = match body.input.as_str() {
+        "A" => Some(KeypadKey::A),
+        "B" => Some(KeypadKey::B),
+        "D" => Some(KeypadKey::Down),
+        "U" => Some(KeypadKey::Up),
+        "L" => Some(KeypadKey::Left),
+        "R" => Some(KeypadKey::Right),
+        "START" => Some(KeypadKey::Start),
+        "SEL" => Some(KeypadKey::Select),
+        _ => {
+            // invalid move submitted
+            None
+        }
+    };
+
+    return if let Some(movement) = add_move {
+        app_state.pending_moves.push(movement);
+        StatusCode::CREATED
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
-fn real_main() -> i32 {
+async fn get_buffer(State(state): State<Arc<Mutex<AppState>>>) -> impl IntoResponse {
+    let app_state = state.lock().unwrap();
+    let buffer = &app_state.image_buffer;
+    let mut writer = Cursor::new(Vec::new());
+
+    buffer.write_to(&mut writer, ImageFormat::Jpeg).unwrap();
+
+    let headers = [
+        (header::CONTENT_TYPE, "image/jpeg")
+    ];
+
+    return (headers, writer.into_inner()).into_response();
+}
+
+async fn real_main() -> i32 {
     let matches = clap::Command::new("rboy")
         .version("0.1")
         .author("Mathijs van de Nes")
         .about("A Gameboy Colour emulator written in Rust")
         .arg(clap::Arg::new("filename")
-             .help("Sets the ROM file to load")
-             .required(true))
+            .help("Sets the ROM file to load")
+            .default_value("roms/pkblue.gb"))
         .arg(clap::Arg::new("serial")
-             .help("Prints the data from the serial port to stdout")
-             .short('s')
-             .long("serial")
-             .action(clap::ArgAction::SetTrue))
+            .help("Prints the data from the serial port to stdout")
+            .short('s')
+            .long("serial")
+            .action(clap::ArgAction::SetTrue))
         .arg(clap::Arg::new("printer")
-             .help("Emulates a gameboy printer")
-             .short('p')
-             .long("printer")
-             .action(clap::ArgAction::SetTrue))
+            .help("Emulates a gameboy printer")
+            .short('p')
+            .long("printer")
+            .action(clap::ArgAction::SetTrue))
         .arg(clap::Arg::new("classic")
-             .help("Forces the emulator to run in classic Gameboy mode")
-             .short('c')
-             .long("classic")
-             .action(clap::ArgAction::SetTrue))
+            .help("Forces the emulator to run in classic Gameboy mode")
+            .short('c')
+            .long("classic")
+            .action(clap::ArgAction::SetTrue))
         .arg(clap::Arg::new("scale")
-             .help("Sets the scale of the interface. Default: 2")
-             .short('x')
-             .long("scale")
-             .value_parser(parse_scale_var))
+            .help("Sets the scale of the interface. Default: 2")
+            .short('x')
+            .long("scale")
+            .value_parser(parse_scale_var))
         .arg(clap::Arg::new("audio")
-             .help("Enables audio")
-             .short('a')
-             .long("audio")
-             .action(clap::ArgAction::SetTrue))
+            .help("Enables audio")
+            .short('a')
+            .long("audio")
+            .action(clap::ArgAction::SetTrue))
         .arg(clap::Arg::new("skip-checksum")
-             .help("Skips verification of the cartridge checksum")
-             .long("skip-checksum")
-             .action(clap::ArgAction::SetTrue))
+            .help("Skips verification of the cartridge checksum")
+            .long("skip-checksum")
+            .action(clap::ArgAction::SetTrue))
         .arg(clap::Arg::new("test-mode")
-             .help("Starts the emulator in a special test mode")
-             .long("test-mode")
-             .action(clap::ArgAction::SetTrue))
+            .help("Starts the emulator in a special test mode")
+            .long("test-mode")
+            .action(clap::ArgAction::SetTrue))
         .get_matches();
 
     let test_mode = matches.get_one::<bool>("test-mode").copied().unwrap();
@@ -142,11 +216,11 @@ fn real_main() -> i32 {
             Some((v, s)) => {
                 cpu.enable_audio(Box::new(v) as Box<dyn rboy::AudioPlayer>);
                 cpal_audio_stream = Some(s);
-            },
+            }
             None => {
                 warn("Could not open audio device");
                 return EXITCODE_CPULOADFAILS;
-            },
+            }
         }
     }
     let romname = cpu.romname();
@@ -159,17 +233,44 @@ fn real_main() -> i32 {
     let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new().set_window_builder(window_builder).build(&event_loop);
     set_window_size(&window, scale);
 
-    let mut texture = glium::texture::texture2d::Texture2d::empty_with_format(
-            &display,
-            glium::texture::UncompressedFloatFormat::U8U8U8,
-            glium::texture::MipmapsOption::NoMipmap,
-            rboy::SCREEN_W as u32,
-            rboy::SCREEN_H as u32)
+    let mut texture = Texture2d::empty_with_format(
+        &display,
+        glium::texture::UncompressedFloatFormat::U8U8U8,
+        glium::texture::MipmapsOption::NoMipmap,
+        rboy::SCREEN_W as u32,
+        rboy::SCREEN_H as u32)
         .unwrap();
+
+    let render_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(SCREEN_W as u32, SCREEN_H as u32);
+
+    let app_state = AppState {
+        pending_moves: Vec::new(),
+        image_buffer: render_buffer
+    };
+
+    let app_state = Arc::new(Mutex::new(app_state));
+
+    let app = Router::new()
+        .route("/buffer", get(get_buffer))
+        .route("/move", post(new_move))
+        .with_state(app_state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:3069").await.unwrap();
+
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                _ = close_rx.await;
+            })
+            .await
+            .unwrap();
+    });
 
     let mut renderoptions = <RenderOptions as Default>::default();
 
-    let cputhread = thread::spawn(move|| run_cpu(cpu, sender2, receiver1));
+    let cputhread = thread::spawn(move || run_cpu(cpu, sender2, receiver1));
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     'evloop: loop {
@@ -182,30 +283,30 @@ fn real_main() -> i32 {
             match ev {
                 Event::WindowEvent { event, .. } => match event {
                     WindowEvent::CloseRequested
-                        => elwt.exit(),
+                    => elwt.exit(),
                     WindowEvent::KeyboardInput { event: keyevent, .. } => match (keyevent.state, keyevent.logical_key.as_ref()) {
                         (Pressed, Key::Named(NamedKey::Escape))
-                            => elwt.exit(),
+                        => elwt.exit(),
                         (Pressed, Key::Character("1"))
-                            => set_window_size(&window, 1),
+                        => set_window_size(&window, 1),
                         (Pressed, Key::Character("r" | "R"))
-                            => set_window_size(&window, scale),
+                        => set_window_size(&window, scale),
                         (Pressed, Key::Named(NamedKey::Shift))
-                            => { let _ = sender1.send(GBEvent::SpeedUp); },
+                        => { let _ = sender1.send(GBEvent::SpeedUp); }
                         (Released, Key::Named(NamedKey::Shift))
-                            => { let _ = sender1.send(GBEvent::SpeedDown); },
+                        => { let _ = sender1.send(GBEvent::SpeedDown); }
                         (Pressed, Key::Character("t" | "T"))
-                            => { renderoptions.linear_interpolation = !renderoptions.linear_interpolation; }
+                        => { renderoptions.linear_interpolation = !renderoptions.linear_interpolation; }
                         (Pressed, winitkey) => {
                             if let Some(key) = winit_to_keypad(winitkey) {
                                 let _ = sender1.send(GBEvent::KeyDown(key));
                             }
-                        },
+                        }
                         (Released, winitkey) => {
                             if let Some(key) = winit_to_keypad(winitkey) {
                                 let _ = sender1.send(GBEvent::KeyUp(key));
                             }
-                        },
+                        }
                     },
                     _ => (),
                 },
@@ -217,15 +318,16 @@ fn real_main() -> i32 {
             break 'evloop;
         }
         match receiver2.recv() {
-            Ok(data) => recalculate_screen(&display, &mut texture, &*data, &renderoptions),
+            Ok(data) => recalculate_screen(&display, &mut texture, &mut app_state.clone(), &*data, &renderoptions),
             Err(..) => break 'evloop, // Remote end has hung-up
         }
     }
 
     drop(cpal_audio_stream);
     drop(receiver2); // Stop CPU thread by disconnecting
-    let _ = cputhread.join();
+    _ = cputhread.join();
 
+    _ = close_tx.send(());
     EXITCODE_SUCCESS
 }
 
@@ -244,17 +346,17 @@ fn winit_to_keypad(key: winit::keyboard::Key<&str>) -> Option<rboy::KeypadKey> {
     }
 }
 
-fn recalculate_screen<T: glium::glutin::surface::SurfaceTypeTrait + glium::glutin::surface::ResizeableSurface + 'static>(display: &glium::Display<T>,
-                      texture: &mut glium::texture::texture2d::Texture2d,
-                      datavec: &[u8],
-                      renderoptions: &RenderOptions)
+fn recalculate_screen<T: SurfaceTypeTrait + ResizeableSurface + 'static>(display: &glium::Display<T>,
+                                                                         texture: &mut Texture2d,
+                                                                         render_buffer: &mut Arc<Mutex<AppState>>,
+                                                                         datavec: &[u8],
+                                                                         renderoptions: &RenderOptions)
 {
     use glium::Surface;
 
     let interpolation_type = if renderoptions.linear_interpolation {
         glium::uniforms::MagnifySamplerFilter::Linear
-    }
-    else {
+    } else {
         glium::uniforms::MagnifySamplerFilter::Nearest
     };
 
@@ -264,12 +366,18 @@ fn recalculate_screen<T: glium::glutin::surface::SurfaceTypeTrait + glium::gluti
         height: rboy::SCREEN_H as u32,
         format: glium::texture::ClientFormat::U8U8U8,
     };
+
+    {
+        let mut app_state = render_buffer.lock().unwrap();
+        app_state.image_buffer.copy_from_slice(&datavec);
+    }
+
     texture.write(
         glium::Rect {
             left: 0,
             bottom: 0,
             width: rboy::SCREEN_W as u32,
-            height: rboy::SCREEN_H as u32
+            height: rboy::SCREEN_H as u32,
         },
         rawimage2d);
 
@@ -282,7 +390,7 @@ fn recalculate_screen<T: glium::glutin::surface::SurfaceTypeTrait + glium::gluti
             left: 0,
             bottom: target_h,
             width: target_w as i32,
-            height: -(target_h as i32)
+            height: -(target_h as i32),
         },
         interpolation_type);
     target.finish().unwrap();
@@ -299,14 +407,16 @@ fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output
     };
     let mut c = match opt_c
     {
-        Ok(cpu) => { cpu },
-        Err(message) => { warn(message); return None; },
+        Ok(cpu) => { cpu }
+        Err(message) => {
+            warn(message);
+            return None;
+        }
     };
 
     if output_printer {
         c.attach_printer();
-    }
-    else {
+    } else {
         c.set_stdout(output_serial);
     }
 
@@ -340,9 +450,12 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
                         GBEvent::KeyUp(key) => cpu.keyup(key),
                         GBEvent::KeyDown(key) => cpu.keydown(key),
                         GBEvent::SpeedUp => limit_speed = false,
-                        GBEvent::SpeedDown => { limit_speed = true; cpu.sync_audio(); }
+                        GBEvent::SpeedDown => {
+                            limit_speed = true;
+                            cpu.sync_audio();
+                        }
                     }
-                },
+                }
                 Err(TryRecvError::Empty) => break 'recv,
                 Err(TryRecvError::Disconnected) => break 'outer,
             }
@@ -367,9 +480,9 @@ fn timer_periodic(ms: u64) -> Receiver<()> {
 
 fn set_window_size(window: &winit::window::Window, scale: u32) {
     let _ = window.request_inner_size(winit::dpi::LogicalSize::<u32>::from((
-            rboy::SCREEN_W as u32 * scale,
-            rboy::SCREEN_H as u32 * scale,
-        )));
+        rboy::SCREEN_W as u32 * scale,
+        rboy::SCREEN_H as u32 * scale,
+    )));
 }
 
 struct CpalPlayer {
@@ -399,8 +512,7 @@ impl CpalPlayer {
             if f.channels() == 2 && f.sample_format() == cpal::SampleFormat::F32 {
                 if f.min_sample_rate() <= wanted_samplerate && wanted_samplerate <= f.max_sample_rate() {
                     supported_config = Some(f.with_sample_rate(wanted_samplerate));
-                }
-                else {
+                } else {
                     supported_config = Some(f.with_max_sample_rate());
                 }
                 break;
@@ -413,7 +525,7 @@ impl CpalPlayer {
         let selected_config = supported_config.unwrap();
 
         let sample_format = selected_config.sample_format();
-        let config : cpal::StreamConfig = selected_config.into();
+        let config: cpal::StreamConfig = selected_config.into();
 
         let err_fn = |err| eprintln!("An error occurred on the output audio stream: {}", err);
 
@@ -426,16 +538,16 @@ impl CpalPlayer {
         };
 
         let stream = match sample_format {
-            cpal::SampleFormat::I8 => device.build_output_stream(&config, move|data: &mut [i8], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::I16 => device.build_output_stream(&config, move|data: &mut [i16], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::I32 => device.build_output_stream(&config, move|data: &mut [i32], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::I64 => device.build_output_stream(&config, move|data: &mut [i64], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::U8 => device.build_output_stream(&config, move|data: &mut [u8], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::U16 => device.build_output_stream(&config, move|data: &mut [u16], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::U32 => device.build_output_stream(&config, move|data: &mut [u32], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::U64 => device.build_output_stream(&config, move|data: &mut [u64], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::F32 => device.build_output_stream(&config, move|data: &mut [f32], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
-            cpal::SampleFormat::F64 => device.build_output_stream(&config, move|data: &mut [f64], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::I8 => device.build_output_stream(&config, move |data: &mut [i8], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::I16 => device.build_output_stream(&config, move |data: &mut [i16], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::I32 => device.build_output_stream(&config, move |data: &mut [i32], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::I64 => device.build_output_stream(&config, move |data: &mut [i64], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::U8 => device.build_output_stream(&config, move |data: &mut [u8], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::U16 => device.build_output_stream(&config, move |data: &mut [u16], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::U32 => device.build_output_stream(&config, move |data: &mut [u32], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::U64 => device.build_output_stream(&config, move |data: &mut [u64], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::F32 => device.build_output_stream(&config, move |data: &mut [f32], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
+            cpal::SampleFormat::F64 => device.build_output_stream(&config, move |data: &mut [f64], _callback_info: &cpal::OutputCallbackInfo| cpal_thread(data, &stream_buffer), err_fn, None),
             sf => panic!("Unsupported sample format {}", sf),
         }.unwrap();
 
@@ -445,12 +557,12 @@ impl CpalPlayer {
     }
 }
 
-fn cpal_thread<T: Sample + FromSample<f32>>(outbuffer: &mut[T], audio_buffer: &Arc<Mutex<Vec<(f32, f32)>>>) {
+fn cpal_thread<T: Sample + FromSample<f32>>(outbuffer: &mut [T], audio_buffer: &Arc<Mutex<Vec<(f32, f32)>>>) {
     let mut inbuffer = audio_buffer.lock().unwrap();
-    let outlen =  ::std::cmp::min(outbuffer.len() / 2, inbuffer.len());
+    let outlen = ::std::cmp::min(outbuffer.len() / 2, inbuffer.len());
     for (i, (in_l, in_r)) in inbuffer.drain(..outlen).enumerate() {
-        outbuffer[i*2] = T::from_sample(in_l);
-        outbuffer[i*2+1] = T::from_sample(in_r);
+        outbuffer[i * 2] = T::from_sample(in_l);
+        outbuffer[i * 2 + 1] = T::from_sample(in_r);
     }
 }
 
@@ -464,7 +576,7 @@ impl rboy::AudioPlayer for CpalPlayer {
             if buffer.len() > self.sample_rate as usize {
                 // Do not fill the buffer with more than 1 second of data
                 // This speeds up the resync after the turning on and off the speed limiter
-                return
+                return;
             }
             buffer.push((*l, *r));
         }
@@ -501,7 +613,10 @@ fn run_test_mode(filename: &str, classic_mode: bool, skip_checksum: bool) -> i32
         false => Device::new_cgb(filename, skip_checksum),
     };
     let mut cpu = match opt_cpu {
-        Err(errmsg) => { warn(errmsg); return EXITCODE_CPULOADFAILS; },
+        Err(errmsg) => {
+            warn(errmsg);
+            return EXITCODE_CPULOADFAILS;
+        }
         Ok(cpu) => cpu,
     };
 
@@ -518,13 +633,13 @@ fn run_test_mode(filename: &str, classic_mode: bool, skip_checksum: bool) -> i32
                     b's' => {
                         let data = cpu.get_gpu_data().to_vec();
                         print_screenshot(data);
-                    },
+                    }
                     v => {
                         eprintln!("MSG:Unknown stdinvalue {}", v);
-                    },
+                    }
                 }
-            },
-            Err(TryRecvError::Empty) => {},
+            }
+            Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => break,
         }
         for _ in 0..1000 {
@@ -540,7 +655,7 @@ fn spawn_stdin_channel() -> Receiver<u8> {
         let mut buffer = [0];
         match io::stdin().read(&mut buffer) {
             Ok(1) => tx.send(buffer[0]).unwrap(),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             _ => break,
         };
     });
