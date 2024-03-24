@@ -271,7 +271,7 @@ async fn real_main() -> i32 {
                     let sender1 = sender1_timer.lock().unwrap();
                     _ = sender1.send(GBEvent::KeyDown(top_key));
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(16)).await;
                 {
                     let sender1 = sender1_timer.lock().unwrap();
                     _ = sender1.send(GBEvent::KeyUp(top_key));
@@ -456,7 +456,7 @@ fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output
 }
 
 fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver<GBEvent>) {
-    let periodic = timer_periodic(16);
+    let periodic = timer_periodic(4);
     let mut limit_speed = true;
 
     let waitticks = (4194304f64 / 1000.0 * 16.0).round() as u32;
